@@ -1,0 +1,111 @@
+# Lint the action, and run it on real runners in each mode
+---
+name: Test
+
+'on':
+  pull_request:
+    types: [opened, reopened, synchronize]
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    name: 'Lint'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run actionlint
+        run: |
+          bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+      - name: Run shellcheck
+        run: shellcheck setup-vagrant-libvirt.bash
+
+  # cache-only first, so the install jobs that follow can restore its packages
+  cache:
+    name: 'Cache-only (${{ matrix.runner }})'
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: vagrant
+        uses: ./
+        with:
+          cache-only: 'true'
+      - name: Check the result
+        env:
+          SOURCE: ${{ steps.vagrant.outputs.source }}
+        run: |
+          echo "source: ${SOURCE}"
+          . /etc/os-release
+          if [ "$VERSION_CODENAME" = 'noble' ]; then
+            [[ "$SOURCE" =~ ^(cached|saved)$ ]]
+          else
+            [ "$SOURCE" = 'none' ]
+          fi
+          ! command -v vagrant
+
+  # `noble` is the source expected where the runner is on noble, which the
+  # PPA publishes for; on any other series it is always hashicorp
+  install:
+    name: 'Install (${{ matrix.runner }}, cache ${{ matrix.cache }}, Launchpad ${{ matrix.launchpad }})'
+    needs: cache
+    strategy:
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, cache: 'true', launchpad: reachable, noble: cache}
+          - {runner: ubuntu-24.04, cache: 'true', launchpad: blocked, noble: cache}
+          - {runner: ubuntu-24.04, cache: 'false', launchpad: reachable, noble: ppa}
+          - {runner: ubuntu-24.04, cache: 'false', launchpad: blocked, noble: hashicorp}
+          - {runner: ubuntu-latest, cache: 'true', launchpad: reachable, noble: cache}
+      fail-fast: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Block Launchpad
+        if: matrix.launchpad == 'blocked'
+        run: |
+          for host in ppa.launchpadcontent.net ppa.launchpad.net api.launchpad.net launchpad.net keyserver.ubuntu.com; do
+            echo "0.0.0.0 ${host}" | sudo tee -a /etc/hosts
+          done
+      - id: vagrant
+        uses: ./
+        with:
+          cache: ${{ matrix.cache }}
+      - name: Check the result
+        env:
+          SOURCE: ${{ steps.vagrant.outputs.source }}
+          NOBLE: ${{ matrix.noble }}
+        run: |
+          . /etc/os-release
+          expected=hashicorp
+          if [ "$VERSION_CODENAME" = 'noble' ]; then
+            expected=$NOBLE
+          fi
+          echo "source: ${SOURCE} (expected ${expected})"
+          [ "$SOURCE" = "$expected" ]
+          vagrant --version
+          vagrant plugin list | grep vagrant-libvirt
+          virsh --connect qemu:///system list --all
+
+  # The one check for branch protection to require: GitHub only blocks a
+  # merge on checks listed by name, and this job fails unless every job it
+  # needs succeeded. Add any new job in this workflow to `needs:`.
+  all-checks:
+    name: 'All checks'
+    if: always()
+    needs:
+      - lint
+      - cache
+      - install
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Fail unless every needed job succeeded'
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"
+          jq -e 'all(.[]; .result == "success")' <<< "$NEEDS" > /dev/null
